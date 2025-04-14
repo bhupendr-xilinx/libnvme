@@ -428,12 +428,12 @@ int nvme_mi_submit(nvme_mi_ep_t ep, struct nvme_mi_req *req,
 		errno = EINVAL;
 		return -1;
 	}
-
+#if 0
 	if (req->data_len & 0x3) {
 		errno = EINVAL;
 		return -1;
 	}
-
+#endif
 	if (resp->hdr_len < sizeof(struct nvme_mi_msg_hdr)) {
 		errno = EINVAL;
 		return -1;
@@ -720,7 +720,8 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 				 __u32 cdw10, __u32 cdw11, __u32 cdw12,
 				 __u32 cdw13, __u32 cdw14, __u32 cdw15,
 				 __u32 data_len, void *data, __u32 metadata_len,
-				 void *metadata, __u32 timeout_ms, __u32 *result)
+				 void *metadata, __u32 timeout_ms, __u32 *result, __u8 csi,
+				__u32 offset)
 {
 	/* Input parameters flags, rsvd, metadata, metadata_len are not used */
 	struct nvme_mi_admin_resp_hdr resp_hdr;
@@ -755,6 +756,12 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 	}
 
 	nvme_mi_admin_init_req(&req, &req_hdr, ctrl->id, opcode);
+	if (csi == 1) {
+		req_hdr.hdr.nmp = (NVME_MI_ROR_REQ << 7) |
+							(NVME_MI_MT_ADMIN << 3) | csi;
+	}
+
+	printf("req_hdr.hdr.nmp :: %d\n",req_hdr.hdr.nmp);
 	req_hdr.cdw1 = cpu_to_le32(nsid);
 	req_hdr.cdw2 = cpu_to_le32(cdw2);
 	req_hdr.cdw3 = cpu_to_le32(cdw3);
@@ -764,7 +771,7 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 	req_hdr.cdw13 = cpu_to_le32(cdw13);
 	req_hdr.cdw14 = cpu_to_le32(cdw14);
 	req_hdr.cdw15 = cpu_to_le32(cdw15);
-	req_hdr.doff = 0;
+	req_hdr.doff = cpu_to_le32(offset);;
 	if (data_len != 0) {
 		req_hdr.dlen = cpu_to_le32(data_len);
 		/* Bit 0 set to 1 means DLEN contains a value */
@@ -1604,7 +1611,8 @@ int nvme_mi_mi_xfer(nvme_mi_ep_t ep,
 		       struct nvme_mi_mi_req_hdr *mi_req,
 		       size_t req_data_size,
 		       struct nvme_mi_mi_resp_hdr *mi_resp,
-		       size_t *resp_data_size)
+		       size_t *resp_data_size,
+		       __u8 csi)
 {
 	int rc;
 	struct nvme_mi_req req;
@@ -1626,6 +1634,7 @@ int nvme_mi_mi_xfer(nvme_mi_ep_t ep,
 		return -1;
 	}
 
+#if 0
 	/* request and response lengths & offset must be aligned */
 	if ((req_data_size & 0x3) ||
 	    (*resp_data_size & 0x3)) {
@@ -1638,10 +1647,10 @@ int nvme_mi_mi_xfer(nvme_mi_ep_t ep,
 		errno = EINVAL;
 		return -1;
 	}
-
+#endif
 	mi_req->hdr.type = NVME_MI_MSGTYPE_NVME;
 	mi_req->hdr.nmp = (NVME_MI_ROR_REQ << 7) |
-				(NVME_MI_MT_MI << 3);
+				(NVME_MI_MT_MI << 3) | csi;
 
 	memset(&req, 0, sizeof(req));
 	req.hdr = &mi_req->hdr;

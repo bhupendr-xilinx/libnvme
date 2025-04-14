@@ -757,7 +757,8 @@ int nvme_mi_mi_xfer(nvme_mi_ep_t ep,
 		       struct nvme_mi_mi_req_hdr *mi_req,
 		       size_t req_data_size,
 		       struct nvme_mi_mi_resp_hdr *mi_resp,
-		       size_t *resp_data_size);
+		       size_t *resp_data_size
+		       __u8 csi);
 
 /**
  * nvme_mi_mi_read_mi_data_subsys() - Perform a Read MI Data Structure command,
@@ -1094,7 +1095,8 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 				 __u32 cdw10, __u32 cdw11, __u32 cdw12,
 				 __u32 cdw13, __u32 cdw14, __u32 cdw15,
 				 __u32 data_len, void *data, __u32 metadata_len,
-				 void *metadata, __u32 timeout_ms, __u32 *result);
+				 void *metadata, __u32 timeout_ms, __u32 *result,
+				 __u8 csi, __u32 offset);
 
 /**
  * nvme_mi_admin_identify_partial() - Perform an Admin identify command,
