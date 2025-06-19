@@ -505,6 +505,38 @@ int nvme_mi_submit(nvme_mi_ep_t ep, struct nvme_mi_req *req,
 	return 0;
 }
 
+int nvme_mi_batch_submit(nvme_mi_ep_t ep, struct nvme_mi_req *req)
+{
+	int rc;
+
+	if (req->hdr_len < sizeof(struct nvme_mi_msg_hdr)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (req->hdr_len & 0x3) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	nvme_mi_ep_probe(ep);
+
+	if (ep->transport->mic_enabled)
+		nvme_mi_calc_req_mic(req);
+
+	if (nvme_mi_ep_has_quirk(ep, NVME_QUIRK_MIN_INTER_COMMAND_TIME))
+		nvme_mi_insert_delay(ep);
+
+	rc = ep->transport->async_submit(ep, req);
+
+	if (rc) {
+		nvme_msg(ep->root, LOG_INFO, "transport failure\n");
+		return rc;
+	}
+	
+	return 0;
+}
+
 static void nvme_mi_admin_init_req(struct nvme_mi_req *req,
 				   struct nvme_mi_admin_req_hdr *hdr,
 				   __u16 ctrl_id, __u8 opcode)
@@ -532,15 +564,22 @@ static void nvme_mi_admin_init_resp(struct nvme_mi_resp *resp,
 
 static void nvme_mi_control_init_req(struct nvme_mi_req *req,
 				    struct nvme_mi_control_req *control_req,
-				    __u8 opcode, __u16 cpsp)
+				    __u8 opcode, __u16 cpsp, __u8 csi, __u8 tag)
 {
 	memset(req, 0, sizeof(*req));
 	memset(control_req, 0, sizeof(*control_req));
 
 	control_req->hdr.type = NVME_MI_MSGTYPE_NVME;
-	control_req->hdr.nmp = (NVME_MI_ROR_REQ << 7) |
-		(NVME_MI_MT_CONTROL << 3); /* we always use command slot 0 */
+	if (csi == 1) {
+		control_req->hdr.nmp = (NVME_MI_ROR_REQ << 7) |
+							(NVME_MI_MT_CONTROL << 3) | csi;
+	}
+	else {
+		control_req->hdr.nmp = (NVME_MI_ROR_REQ << 7) |
+							(NVME_MI_MT_CONTROL << 3);
+	}
 	control_req->opcode = opcode;
+	control_req->tag = tag;
 	control_req->cpsp = cpu_to_le16(cpsp);
 
 	req->hdr = &control_req->hdr;
@@ -599,6 +638,11 @@ static int nvme_mi_admin_parse_status(struct nvme_mi_resp *resp, __u32 *result)
 	 */
 	nvme_status = le32_to_cpu(admin_hdr->cdw3) >> 17;
 
+	printf("\nnvme_mi_admin_parse_status: cdw0=0x%08x, cdw1=0x%08x, cdw3=0x%08x\n",
+		le32_to_cpu(admin_hdr->cdw0),
+		le32_to_cpu(admin_hdr->cdw1),
+		le32_to_cpu(admin_hdr->cdw3));
+
 	/* the result pointer, optionally stored if the caller needs it */
 	if (result)
 		*result = nvme_result;
@@ -616,10 +660,18 @@ static int nvme_mi_control_parse_status(struct nvme_mi_resp *resp, __u16 *cpsr)
 	}
 	control_resp = (struct nvme_mi_control_resp *)resp->hdr;
 
-	if (control_resp->status)
+	if (control_resp->status) {
+		if (control_resp->status == 4){
+			printf("Invalid Parameter PEL:\n");
+			printf("BITLOC: %02x\n", control_resp->tag & 0x07);
+			printf("BYTLOC: %04x\n", le16_to_cpu(control_resp->cpsr));
+			return control_resp->status;
+		}
 		return control_resp->status |
 			(NVME_STATUS_TYPE_MI << NVME_STATUS_TYPE_SHIFT);
+	}
 
+	printf("TAG : %d\n", control_resp->tag);
 	if (cpsr)
 		*cpsr = le16_to_cpu(control_resp->cpsr);
 
@@ -721,7 +773,7 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 				 __u32 cdw13, __u32 cdw14, __u32 cdw15,
 				 __u32 data_len, void *data, __u32 metadata_len,
 				 void *metadata, __u32 timeout_ms, __u32 *result, __u8 csi,
-				__u32 offset)
+				 __u32 offset)
 {
 	/* Input parameters flags, rsvd, metadata, metadata_len are not used */
 	struct nvme_mi_admin_resp_hdr resp_hdr;
@@ -771,7 +823,7 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 	req_hdr.cdw13 = cpu_to_le32(cdw13);
 	req_hdr.cdw14 = cpu_to_le32(cdw14);
 	req_hdr.cdw15 = cpu_to_le32(cdw15);
-	req_hdr.doff = cpu_to_le32(offset);;
+	req_hdr.doff = cpu_to_le32(offset);
 	if (data_len != 0) {
 		req_hdr.dlen = cpu_to_le32(data_len);
 		/* Bit 0 set to 1 means DLEN contains a value */
@@ -818,6 +870,75 @@ int nvme_mi_admin_admin_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
 	return 0;
 }
 
+int nvme_mi_admin_batch_passthru(nvme_mi_ctrl_t ctrl, __u8 opcode, __u8 flags,
+				 __u16 rsvd, __u32 nsid, __u32 cdw2, __u32 cdw3,
+				 __u32 cdw10, __u32 cdw11, __u32 cdw12,
+				 __u32 cdw13, __u32 cdw14, __u32 cdw15,
+				 __u32 data_len, void *data, __u32 metadata_len,
+				void *metadata, __u32 timeout_ms, __u32 *result,
+				__u8 csi, __u32 offset)
+{
+	struct nvme_mi_admin_req_hdr req_hdr;
+	struct nvme_mi_req req;
+	unsigned int timeout_save;
+	int rc;
+
+	if (data_len > 4096) {
+		nvme_msg(ctrl->ep->root, LOG_ERR,
+			"nvme_mi_admin_batch_passthru doesn't support data_len over 4096 bytes.\n");
+		errno = EINVAL;
+		return -1;
+	}
+
+	nvme_mi_admin_init_req(&req, &req_hdr, ctrl->id, opcode);
+	if (csi == 1) {
+		req_hdr.hdr.nmp = (NVME_MI_ROR_REQ << 7) |
+							(NVME_MI_MT_ADMIN << 3) | csi;
+	}
+
+	req_hdr.cdw1 = cpu_to_le32(nsid);
+	req_hdr.cdw2 = cpu_to_le32(cdw2);
+	req_hdr.cdw3 = cpu_to_le32(cdw3);
+	req_hdr.cdw10 = cpu_to_le32(cdw10);
+	req_hdr.cdw11 = cpu_to_le32(cdw11);
+	req_hdr.cdw12 = cpu_to_le32(cdw12);
+	req_hdr.cdw13 = cpu_to_le32(cdw13);
+	req_hdr.cdw14 = cpu_to_le32(cdw14);
+	req_hdr.cdw15 = cpu_to_le32(cdw15);
+	req_hdr.doff = cpu_to_le32(offset);
+	if (data_len != 0) {
+		req_hdr.dlen = cpu_to_le32(data_len);
+		req_hdr.flags = 0x1;
+		req.data = data;
+		req.data_len = data_len;
+	}
+
+	nvme_mi_calc_req_mic(&req);
+
+	/* if the user has specified a custom timeout, save the current
+	 * timeout and override
+	 */
+	if (timeout_ms != 0) {
+		timeout_save = nvme_mi_ep_get_timeout(ctrl->ep);
+		nvme_mi_ep_set_timeout(ctrl->ep, timeout_ms);
+	}
+
+	rc = nvme_mi_batch_submit(ctrl->ep, &req);
+	//rc = ep->transport->submit(ctrl->ep, &req, NULL);
+	if (timeout_ms != 0) {
+		double timeout_sec = timeout_ms / 1000.0;
+		struct timespec ts;
+		ts.tv_sec = (time_t)timeout_sec;
+		ts.tv_nsec = (long)((timeout_sec - ts.tv_sec) * 1e9);
+		printf("Sleeping for %.2f seconds\n", timeout_sec);
+		nanosleep(&ts, NULL);
+	}
+
+	if (timeout_ms != 0)
+		nvme_mi_ep_set_timeout(ctrl->ep, timeout_save);
+
+	return rc;
+}
 int nvme_mi_admin_identify_partial(nvme_mi_ctrl_t ctrl,
 				   struct nvme_identify_args *args,
 				   off_t offset, size_t size)
@@ -876,24 +997,25 @@ int nvme_mi_admin_identify_partial(nvme_mi_ctrl_t ctrl,
 }
 
 int nvme_mi_control(nvme_mi_ep_t ep, __u8 opcode,
-		    __u16 cpsp, __u16 *result_cpsr)
+		    __u16 cpsp, __u16 *result_cpsr, __u8 csi, __u8 tag)
 {
 	struct nvme_mi_control_resp control_resp;
 	struct nvme_mi_control_req control_req;
 	struct nvme_mi_resp resp;
 	struct nvme_mi_req req;
 	int rc = 0;
-
-	nvme_mi_control_init_req(&req, &control_req, opcode, cpsp);
+	nvme_mi_control_init_req(&req, &control_req, opcode, cpsp, csi, tag);
 	nvme_mi_control_init_resp(&resp, &control_resp);
 
 	rc = nvme_mi_submit(ep, &req, &resp);
-	if (rc)
+	if (rc){
 		return rc;
+	}
 
 	rc = nvme_mi_control_parse_status(&resp, result_cpsr);
-	if (rc)
+	if (rc){
 		return rc;
+	}
 
 	return 0;
 }
@@ -1611,8 +1733,7 @@ int nvme_mi_mi_xfer(nvme_mi_ep_t ep,
 		       struct nvme_mi_mi_req_hdr *mi_req,
 		       size_t req_data_size,
 		       struct nvme_mi_mi_resp_hdr *mi_resp,
-		       size_t *resp_data_size,
-		       __u8 csi)
+		       size_t *resp_data_size, __u8 csi)
 {
 	int rc;
 	struct nvme_mi_req req;
@@ -1649,6 +1770,7 @@ int nvme_mi_mi_xfer(nvme_mi_ep_t ep,
 	}
 #endif
 	mi_req->hdr.type = NVME_MI_MSGTYPE_NVME;
+	printf("CSI :%d\n",csi);
 	mi_req->hdr.nmp = (NVME_MI_ROR_REQ << 7) |
 				(NVME_MI_MT_MI << 3) | csi;
 

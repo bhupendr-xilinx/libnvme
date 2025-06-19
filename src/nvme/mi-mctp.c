@@ -105,6 +105,24 @@ void __nvme_mi_mctp_set_ops(const struct __mi_mctp_socket_ops *newops)
 }
 static const struct nvme_mi_transport nvme_mi_transport_mctp;
 
+#define MCTP_TAG_PREALLOC   0x10
+#define SIOCPROTOPRIVATE 0x89E0
+#define SIOCMCTPALLOCTAG    (SIOCPROTOPRIVATE + 0)
+#define SIOCMCTPDROPTAG        (SIOCPROTOPRIVATE + 1)
+#if 1
+struct mctp_ioc_tag_ctl {
+	mctp_eid_t  peer_addr;
+	/* For SIOCMCTPALLOCTAG: must be passed as zero, kernel will
+ 	* populate with the allocated tag value. Returned tag value will
+	* always have TO and PREALLOC set.
+ 	*
+	* For SIOCMCTPDROPTAG: userspace provides tag value to drop, from
+	* a prior SIOCMCTPALLOCTAG call (and so must have TO and PREALLOC set).
+ 	*/
+ 	__u8        tag;
+	__u16       flags;
+ };
+#endif
 #ifdef SIOCMCTPALLOCTAG
 static __u8 nvme_mi_mctp_tag_alloc(struct nvme_mi_ep *ep)
 {
@@ -249,6 +267,8 @@ static int nvme_mi_mctp_submit(struct nvme_mi_ep *ep,
 	mctp = ep->transport_data;
 	tag = nvme_mi_mctp_tag_alloc(ep);
 
+	printf("Tag alloc value %d\n", tag);
+
 	memset(&addr, 0, sizeof(addr));
 	addr.smctp_family = AF_MCTP;
 	addr.smctp_network = mctp->net;
@@ -383,6 +403,7 @@ retry:
 	 * to keep the tag allocated and retry the recvmsg
 	 */
 	if (nvme_mi_mctp_resp_is_mpr(mctp->resp_buf, len, mic, &mpr_time)) {
+		printf("\nRECEIVED MPR : MPRT value is %d\n", mpr_time);
 		nvme_msg(ep->root, LOG_DEBUG,
 			 "Received More Processing Required, waiting for response\n");
 
@@ -424,6 +445,66 @@ out:
 	return rc;
 }
 
+static int nvme_mi_async_submit(struct nvme_mi_ep *ep, struct nvme_mi_req *req) {
+    struct nvme_mi_transport_mctp *mctp;
+    struct iovec req_iov[3];
+    struct msghdr req_msg;
+    struct sockaddr_mctp addr;
+    ssize_t len;
+    __le32 mic;
+    int i, rc, errno_save, timeout;
+    __u8 tag;
+
+    if (ep->transport != &nvme_mi_transport_mctp) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    mctp = ep->transport_data;
+    tag = nvme_mi_mctp_tag_alloc(ep);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.smctp_family = AF_MCTP;
+    addr.smctp_network = mctp->net;
+    addr.smctp_addr.s_addr = mctp->eid;
+    addr.smctp_type = MCTP_TYPE_NVME | MCTP_TYPE_MIC;
+    addr.smctp_tag = tag; // Adjust tag handling as needed
+
+    memset(&req_msg, 0, sizeof(req_msg));
+    req_msg.msg_name = &addr;
+    req_msg.msg_namelen = sizeof(addr);
+
+    i = 0;
+    req_iov[i].iov_base = ((__u8 *)req->hdr) + 1;
+    req_iov[i].iov_len = req->hdr_len - 1;
+    i++;
+
+    if (req->data_len) {
+        req_iov[i].iov_base = req->data;
+        req_iov[i].iov_len = req->data_len;
+        i++;
+    }
+
+    mic = cpu_to_le32(req->mic);
+	req_iov[i].iov_base = &mic;
+	req_iov[i].iov_len = sizeof(mic);
+	i++;
+
+    req_msg.msg_iov = req_iov;
+    req_msg.msg_iovlen = i;
+
+    len = ops.sendmsg(mctp->sd, &req_msg, 0);
+	if (len < 0) {
+		errno_save = errno;
+		nvme_msg(ep->root, LOG_ERR,
+			 "Failure sending MCTP message: %m\n");
+		errno = errno_save;
+		rc = -1;
+	}
+
+    return 0;
+}
+
 static void nvme_mi_mctp_close(struct nvme_mi_ep *ep)
 {
 	struct nvme_mi_transport_mctp *mctp;
@@ -457,6 +538,7 @@ static const struct nvme_mi_transport nvme_mi_transport_mctp = {
 	.name = "mctp",
 	.mic_enabled = true,
 	.submit = nvme_mi_mctp_submit,
+	.async_submit = nvme_mi_async_submit,
 	.close = nvme_mi_mctp_close,
 	.desc_ep = nvme_mi_mctp_desc_ep,
 };

@@ -240,6 +240,8 @@ struct nvme_mi_transport {
 	int (*submit)(struct nvme_mi_ep *ep,
 		      struct nvme_mi_req *req,
 		      struct nvme_mi_resp *resp);
+	int (*async_submit)(struct nvme_mi_ep *ep,
+				struct nvme_mi_req *req);
 	void (*close)(struct nvme_mi_ep *ep);
 	int (*desc_ep)(struct nvme_mi_ep *ep, char *buf, size_t len);
 	int (*check_timeout)(struct nvme_mi_ep *ep, unsigned int timeout);
